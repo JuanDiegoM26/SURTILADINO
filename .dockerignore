@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!java/
+!java/**
+!lib/
+!lib/postgresql-42.7.14.jar
+!web/
+!web/**
