@@ -15,7 +15,19 @@ import java.util.concurrent.*;
 public class SurtiladinoWeb {
     private static final boolean CLOUD="cloud".equals(System.getenv("SURTI_MODE"));
     private static final AccesoLocal ACCESO = new AccesoLocal(Path.of(System.getProperty("pos.auth",System.getenv().getOrDefault("SURTI_AUTH_FILE",CLOUD?"/etc/secrets/acceso.local.properties":"acceso.local.properties"))),CLOUD);
-    private static final int PORT = Integer.getInteger("pos.port",Integer.parseInt(System.getenv().getOrDefault("PORT",CLOUD?"10000":"8787")));
+    private static final int PORT = elegirPuerto();
+    private static int elegirPuerto() {
+        int preferido=Integer.getInteger("pos.port",Integer.parseInt(System.getenv().getOrDefault("PORT",CLOUD?"10000":"8787")));
+        if(CLOUD || System.getProperty("pos.port")!=null || System.getenv("PORT")!=null)return preferido;
+        // Una ventana anterior puede seguir ejecutando clases antiguas aunque los archivos ya sean nuevos.
+        // No cerrar otros procesos: abrir esta versión en el siguiente puerto local disponible.
+        for(int candidato=preferido;candidato<preferido+20;candidato++) {
+            try(ServerSocket prueba=new ServerSocket()) {
+                prueba.bind(new InetSocketAddress("127.0.0.1",candidato));return candidato;
+            }catch(IOException ocupado) { /* Probar el siguiente puerto local. */ }
+        }
+        throw new IllegalStateException("No hay un puerto local disponible. Cierra una ventana anterior de SURTILADINO y vuelve a abrirlo.");
+    }
     private static final String ORIGIN=origen();
     private static String origen(){
         if(!CLOUD)return "http://127.0.0.1:"+PORT;
@@ -35,21 +47,21 @@ public class SurtiladinoWeb {
         if(CLOUD){
             ACCESO.validarCuenta();
             try(Connection db=ConexionSupabase.abrir()){
-                if(new PosDatos(db).consultar("select version from pos.versiones_esquema where version=2").isEmpty())throw new IllegalStateException("Falta instalar el esquema 2 de SURTILADINO.");
+                if(new PosDatos(db).consultar("select version from pos.versiones_esquema where version=3").isEmpty())throw new IllegalStateException("Falta instalar el esquema 3 de SURTILADINO.");
             }catch(Exception ex){throw new IllegalStateException("No se pudo validar la conexión privada o el esquema de SURTILADINO.");}
         }
         HttpServer server=HttpServer.create(new InetSocketAddress(CLOUD?"0.0.0.0":"127.0.0.1",PORT),0);
         server.createContext("/",SurtiladinoWeb::atender);
         server.setExecutor(Executors.newFixedThreadPool(8)); server.start();
         System.out.println("SURTILADINO web: "+ORIGIN);
-        System.out.println("Mantenga esta ventana abierta. Ctrl+C para cerrar.");
+        if(!CLOUD)System.out.println("Mantenga esta ventana abierta. Ctrl+C para cerrar.");
         if (Arrays.asList(args).contains("--abrir") && java.awt.Desktop.isDesktopSupported())
             java.awt.Desktop.getDesktop().browse(URI.create("http://127.0.0.1:"+PORT));
     }
     private static void atender(HttpExchange x) throws IOException {
         try {
             String path=x.getRequestURI().getPath(), method=x.getRequestMethod();
-            if(path.equals("/healthz") && method.equals("GET")){enviar(x,200,Map.of("status","ok"));return;}
+            if(path.equals("/healthz") && (method.equals("GET")||method.equals("HEAD"))){if(method.equals("HEAD")){headers(x);x.sendResponseHeaders(200,-1);}else enviar(x,200,Map.of("status","ok","app","SURTILADINO","version","3.1"));return;}
             String host=x.getRequestHeaders().getFirst("Host");
             String origin=x.getRequestHeaders().getFirst("Origin");
             String site=x.getRequestHeaders().getFirst("Sec-Fetch-Site");
@@ -59,9 +71,10 @@ public class SurtiladinoWeb {
             }
             AccesoLocal.Sesion sesion=ACCESO.buscar(x.getRequestHeaders().getFirst("Cookie"));
             if (!path.startsWith("/api/")) {
+                if(method.equals("HEAD")){headers(x);x.sendResponseHeaders(path.equals("/")?200:404,-1);return;}
                 if (!method.equals("GET")) { enviar(x,405,Map.of("error","Método no permitido.")); return; }
                 if(path.equals("/") && sesion==null){headers(x);x.getResponseHeaders().set("Location","/login");x.sendResponseHeaders(302,-1);return;}
-                String file=Map.of("/","index.html","/app.js","app.js","/crud.js","crud.js","/style.css","style.css","/login","login.html","/login.js","login.js").get(path);
+                String file=Map.of("/","index.html","/app.js","app.js","/crud.js","crud.js","/style.css","style.css","/login","login.html","/login.js","login.js","/gestion.js","gestion.js").get(path);
                 if (file==null) { enviar(x,404,Map.of("error","No encontrado.")); return; }
                 byte[] body=Files.readAllBytes(Path.of(System.getProperty("pos.web","web"),file));
                 headers(x); x.getResponseHeaders().set("Content-Type",file.endsWith("js")?"text/javascript; charset=utf-8":file.endsWith("css")?"text/css; charset=utf-8":"text/html; charset=utf-8");
@@ -102,11 +115,20 @@ public class SurtiladinoWeb {
             }
             Object result;
             try (Connection db=ConexionSupabase.abrir()) {
+                db.setAutoCommit(false);
                 PosDatos d=new PosDatos(db);
+                d.consultar("select set_config('surti.usuario',?,true)",sesion.usuario);
+                GestionDatos gestion=new GestionDatos(db);
                 CrudDatos crud=new CrudDatos(db);
                 switch(method+" "+path) {
                     case "GET /api/data":
-                        result=Map.of("productos",d.productos(),"clientes",d.clientes(),"convenios",d.convenios(),"maestros",crud.maestros(),"fecha",LocalDate.now(ZoneId.of("America/Bogota")).toString()); break;
+                        result=Map.of("productos",d.productos(),"clientes",d.clientes(),"convenios",d.convenios(),"maestros",crud.maestros(),"gestion",gestion.catalogo(),"fecha",LocalDate.now(ZoneId.of("America/Bogota")).toString()); break;
+                    case "GET /api/reportes": result=gestion.reportes(p.getOrDefault("desde",""),p.getOrDefault("hasta",""));break;
+                    case "GET /api/movimientos": result=gestion.kardex(p.getOrDefault("desde",""),p.getOrDefault("hasta",""),numero(p,"producto"),p.getOrDefault("tipo",""));break;
+                    case "GET /api/auditoria": result=gestion.auditoria();break;
+                    case "POST /api/categorias": case "POST /api/proveedores": result=Map.of("id",gestion.maestro(path.substring(5),p));break;
+                    case "POST /api/configuracion": gestion.configurar(p);result=Map.of("ok",true);break;
+                    case "POST /api/importar": result=Map.of("cantidad",gestion.importar(p.getOrDefault("csv","")));break;
                     case "GET /api/facturas":
                         result=d.consultar("select r.id,to_char(r.fecha at time zone 'America/Bogota','DD/MM/YYYY HH24:MI'),r.cliente_factura,r.total,v.estado,v.reemplazada_por,v.motivo_anulacion from pos.resumen_ventas r join pos.ventas v on v.id=r.id order by r.id desc limit 200"); break;
                     case "GET /api/venta": result=crud.venta(numero(p,"id")); break;
@@ -117,11 +139,11 @@ public class SurtiladinoWeb {
                         LocalDate dia=LocalDate.parse(p.getOrDefault("fecha",""));
                         result=d.consultar("select count(*),coalesce(sum(subtotal),0),coalesce(sum(descuento),0),coalesce(sum(iva),0),coalesce(sum(total),0),coalesce(sum(base-costo),0) from pos.resumen_ventas r where (fecha at time zone 'America/Bogota')::date=? and exists(select 1 from pos.ventas v where v.id=r.id and v.estado='VIGENTE')",java.sql.Date.valueOf(dia)).get(0); break;
                     case "POST /api/clientes":
-                        result=Map.of("id",crud.cliente(p)); break;
-                    case "POST /api/productos": result=Map.of("id",crud.producto(p)); break;
+                        result=Map.of("id",gestion.cliente(p)); break;
+                    case "POST /api/productos": result=Map.of("id",gestion.producto(p)); break;
                     case "POST /api/convenios": result=Map.of("id",crud.convenio(p)); break;
-                    case "POST /api/eliminar": result=Map.of("mensaje",crud.eliminar(campo(p,"modulo",20),numero(p,"id"),numero(p,"version"))); break;
-                    case "POST /api/movimiento": result=Map.of("id",crud.crearMovimiento(p)); break;
+                    case "POST /api/eliminar": result=Map.of("mensaje",gestion.eliminar(campo(p,"modulo",20),numero(p,"id"),numero(p,"version"))); break;
+                    case "POST /api/movimiento": result=Map.of("id",gestion.movimiento(p)); break;
                     case "POST /api/corregir-movimiento": result=Map.of("id",crud.corregirMovimiento(numero(p,"id"),entero(p,"cantidad"),campo(p,"motivo",250))); break;
                     case "POST /api/anular-movimiento": result=Map.of("id",crud.corregirMovimiento(numero(p,"id"),null,campo(p,"motivo",250))); break;
                     case "POST /api/anular-venta": crud.anular(numero(p,"id"),campo(p,"motivo",250));result=Map.of("ok",true);break;
@@ -132,19 +154,24 @@ public class SurtiladinoWeb {
                         for (Map.Entry<String,String> e:p.entrySet()) if(e.getKey().startsWith("item_")) items.put(Long.valueOf(e.getKey().substring(5)),Integer.valueOf(e.getValue()));
                         long original=numero(p,"original");
                         PosDatos.Venta v=original>0?d.cotizarCorreccion(original,numero(p,"cliente"),entero(p,"corriente"),numero(p,"convenio"),items):d.cotizar(numero(p,"cliente"),entero(p,"corriente"),numero(p,"convenio"),items);
+                        v.metodoPago=p.getOrDefault("metodo_pago","EFECTIVO");v.referenciaPago=GestionDatos.texto(p,"referencia_pago",100);v.responsable=sesion.usuario;
+                        if(!Set.of("EFECTIVO","TARJETA","TRANSFERENCIA","NEQUI_DAVIPLATA","QR").contains(v.metodoPago))throw new IllegalArgumentException("Método de pago inválido.");
+                        String recibido=p.getOrDefault("recibido","").trim();v.recibido=recibido.isEmpty()?v.total:new BigDecimal(recibido);
+                        if(v.recibido.scale()>2||v.recibido.compareTo(v.total)<0||(!v.metodoPago.equals("EFECTIVO")&&v.recibido.compareTo(v.total)!=0))throw new IllegalArgumentException("Revisa el pago: debe cubrir el total; para medios electrónicos usa el valor exacto.");
                         String motivo=original>0?campo(p,"motivo",250):"";
                         OFERTAS.entrySet().removeIf(e->e.getValue().vence<System.currentTimeMillis());
                         if(OFERTAS.size()>500) throw new IllegalArgumentException("Hay demasiadas cotizaciones abiertas. Espera unos minutos.");
                         String key=UUID.randomUUID().toString(); OFERTAS.put(key,new Oferta(v,sesion.id,motivo));
                         List<Object> lineas=new ArrayList<>();
                         for(PosDatos.Linea l:v.lineas) lineas.add(Map.of("nombre",l.nombre,"cantidad",l.cantidad,"subtotal",l.subtotal,"descuento",l.descuento,"iva",l.iva,"total",l.total));
-                        result=Map.of("token",key,"cliente",v.nombreCliente,"total",v.total,"lineas",lineas); break;
+                        result=Map.of("token",key,"cliente",v.nombreCliente,"total",v.total,"lineas",lineas,"metodo",v.metodoPago,"recibido",v.recibido,"cambio",v.recibido.subtract(v.total)); break;
                     case "POST /api/vender":
                         Oferta o=OFERTAS.get(p.get("cotizacion"));
                         if(o==null || !o.sesion.equals(sesion.id) || o.vence<System.currentTimeMillis()) throw new IllegalArgumentException("La cotización venció. Revisa la venta otra vez.");
-                        synchronized(o) { if(o.factura==null) o.factura=crud.confirmar(o.venta,o.motivo); result=Map.of("id",o.factura); } break;
+                        synchronized(o) { if(o.factura==null){long nueva=crud.confirmar(o.venta,o.motivo);db.commit();o.factura=nueva;} result=Map.of("id",o.factura); } break;
                     default: enviar(x,404,Map.of("error","Acción no encontrada.")); return;
                 }
+                db.commit();
             }
             enviar(x,200,result);
         } catch (IllegalArgumentException | java.time.DateTimeException e) {
@@ -170,7 +197,7 @@ public class SurtiladinoWeb {
     private static void headers(HttpExchange x) {
         x.getResponseHeaders().set("Cache-Control","no-store");
         x.getResponseHeaders().set("X-Content-Type-Options","nosniff");
-        x.getResponseHeaders().set("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+        x.getResponseHeaders().set("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
         x.getResponseHeaders().set("Referrer-Policy","no-referrer");
         if(CLOUD)x.getResponseHeaders().set("Strict-Transport-Security","max-age=31536000");
     }

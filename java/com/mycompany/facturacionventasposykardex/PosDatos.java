@@ -67,7 +67,8 @@ public class PosDatos {
 
     public static class Linea {
         public long producto;
-        public String nombre;
+        public String nombre,categoria;
+        public BigDecimal tasa = new BigDecimal("19");
         public int cantidad, gratis;
         public BigDecimal precio, costo, subtotal, descuento, base, iva, total;
     }
@@ -75,6 +76,8 @@ public class PosDatos {
         public long id, cliente, convenio, original;
         public int corriente;
         public String nombreCliente, documento, tipoConvenio, nombreConvenio;
+        public String metodoPago="EFECTIVO",referenciaPago="",responsable="Proceso interno";
+        public BigDecimal recibido;
         public BigDecimal porcentaje;
         public List<Linea> lineas = new ArrayList<>();
         public BigDecimal total = new BigDecimal("0.00");
@@ -130,11 +133,13 @@ public class PosDatos {
         // Siempre bloquear en el mismo orden evita bloqueos cruzados entre ventas.
         for (Map.Entry<Long,Integer> e : new TreeMap<>(cantidades).entrySet()) {
             if (e.getValue() == null || e.getValue() <= 0) throw new IllegalArgumentException("Cantidad invalida.");
-            List<String[]> prods = consultar("select nombre,precio_venta,costo_unitario,stock from pos.productos where id=? and activo" + (bloquear ? " for update" : ""), e.getKey());
+            List<String[]> prods = consultar("select nombre,precio_venta,costo_unitario,stock,porcentaje_iva,(select nombre from pos.categorias where id=p.categoria_id) from pos.productos p where id=? and activo" + (bloquear ? " for update" : ""), e.getKey());
             if (prods.isEmpty()) throw new IllegalArgumentException("Producto inexistente o inactivo.");
             String[] p = prods.get(0);
             if (e.getValue().longValue() > Long.parseLong(p[3])+credito.getOrDefault(e.getKey(),0)) throw new IllegalArgumentException("Stock insuficiente para " + p[0]);
             Linea l = calcular(e.getKey(), p[0], new BigDecimal(p[1]), new BigDecimal(p[2]), e.getValue(), v.tipoConvenio, v.porcentaje);
+            l.tasa=new BigDecimal(p[4]);l.categoria=p[5]==null?"Sin categoría":p[5];
+            l.iva=dinero(l.base.multiply(l.tasa).divide(new BigDecimal("100")));l.total=l.base.add(l.iva);
             v.lineas.add(l); v.total = v.total.add(l.total);
         }
         return v;
@@ -150,12 +155,18 @@ public class PosDatos {
             for (Linea l : confirmada.lineas) cantidades.put(l.producto, l.cantidad);
             Venta v = preparar(confirmada.cliente, confirmada.corriente, confirmada.convenio, cantidades, true);
             if (!mismaCotizacion(confirmada, v)) throw new IllegalArgumentException("Los datos cambiaron. Revise una nueva cotizacion antes de confirmar.");
+            if(!java.util.Set.of("EFECTIVO","TARJETA","TRANSFERENCIA","NEQUI_DAVIPLATA","QR").contains(confirmada.metodoPago))throw new IllegalArgumentException("Selecciona un método de pago válido.");
+            BigDecimal recibido=confirmada.recibido==null?v.total:confirmada.recibido;
+            if(recibido.scale()>2||recibido.compareTo(v.total)<0||recibido.compareTo(new BigDecimal("99999999999999.99"))>0)throw new IllegalArgumentException("El valor recibido debe cubrir el total y tener hasta dos decimales.");
+            if(!confirmada.metodoPago.equals("EFECTIVO")&&recibido.compareTo(v.total)!=0)throw new IllegalArgumentException("En pagos electrónicos registra el valor exacto de la venta.");
+            String[] empresa=consultar("select nombre,documento,direccion,ciudad,telefono,pie_factura from pos.configuracion where id=1 for share").get(0);
             v.id = Long.parseLong(consultar("insert into pos.ventas(cliente_id,numero_cliente_corriente,cliente_factura,documento_factura,convenio_id,porcentaje_aplicado,convenio_factura) values (?,?,?,?,?,?,?) returning id",
                     v.cliente > 0 ? v.cliente : null, v.cliente > 0 ? null : v.corriente,
                     v.nombreCliente, v.documento, v.convenio, v.porcentaje,v.nombreConvenio).get(0)[0]);
+            consultar("update pos.ventas set metodo_pago=?,referencia_pago=?,recibido=?,cambio=?,responsable=?,empresa_factura=? where id=? returning id",confirmada.metodoPago,confirmada.referenciaPago,recibido,recibido.subtract(v.total),confirmada.responsable,String.join("\n",empresa),v.id);
             for (Linea l : v.lineas) {
-                long detalle = Long.parseLong(consultar("insert into pos.detalle_ventas(venta_id,producto_id,producto_factura,cantidad,precio_unitario,costo_unitario,unidades_gratis,descuento,porcentaje_iva) values (?,?,?,?,?,?,?,?,19) returning id",
-                        v.id,l.producto,l.nombre,l.cantidad,l.precio,l.costo,l.gratis,l.descuento).get(0)[0]);
+                long detalle = Long.parseLong(consultar("insert into pos.detalle_ventas(venta_id,producto_id,producto_factura,cantidad,precio_unitario,costo_unitario,unidades_gratis,descuento,porcentaje_iva,categoria_factura) values (?,?,?,?,?,?,?,?,?,?) returning id",
+                        v.id,l.producto,l.nombre,l.cantidad,l.precio,l.costo,l.gratis,l.descuento,l.tasa,l.categoria).get(0)[0]);
                 try (PreparedStatement p = db.prepareStatement("insert into pos.movimientos_kardex(producto_id,tipo,cantidad,detalle_venta_id,observacion) values (?,'SALIDA',?,?,'Venta SURTILADINO')")) {
                     p.setLong(1,l.producto); p.setInt(2,l.cantidad); p.setLong(3,detalle); p.executeUpdate();
                 }
@@ -176,26 +187,28 @@ public class PosDatos {
         for (int i=0;i<a.lineas.size();i++) {
             Linea x=a.lineas.get(i), y=b.lineas.get(i);
             if (x.producto!=y.producto || !x.nombre.equals(y.nombre) || x.precio.compareTo(y.precio)!=0
-                    || x.costo.compareTo(y.costo)!=0 || x.total.compareTo(y.total)!=0) return false;
+                    || x.costo.compareTo(y.costo)!=0 || x.tasa.compareTo(y.tasa)!=0 || x.total.compareTo(y.total)!=0) return false;
         }
         return true;
     }
 
     public String factura(long id) throws SQLException {
-        List<String[]> cab = consultar("select v.id,to_char(v.fecha at time zone 'America/Bogota','DD/MM/YYYY HH24:MI:SS'),v.cliente_factura,v.documento_factura,v.convenio_factura,v.porcentaje_aplicado,v.estado,v.motivo_anulacion,v.reemplazada_por from pos.ventas v where v.id=?",id);
+        List<String[]> cab = consultar("select v.id,to_char(v.fecha at time zone 'America/Bogota','DD/MM/YYYY HH24:MI:SS'),v.cliente_factura,v.documento_factura,v.convenio_factura,v.porcentaje_aplicado,v.estado,v.motivo_anulacion,v.reemplazada_por,v.metodo_pago,v.referencia_pago,v.recibido,v.cambio,v.responsable,v.empresa_factura from pos.ventas v where v.id=?",id);
         if (cab.isEmpty()) return "No existe esa factura.";
         String[] c=cab.get(0);
         StringBuilder texto=new StringBuilder("\n===== SURTILADINO - FACTURA =====\nNumero: "+c[0]+"\nFecha y hora (Bogota): "+c[1]+"\nCliente: "+c[2]);
         if (c[3]!=null) texto.append("\n").append(c[3]); else texto.append("\nCliente corriente sin registro");
         texto.append("\nConvenio: ").append(c[4]).append(" | Porcentaje: ").append(c[5]).append("%");
         texto.append("\nEstado: ").append(c[6]);
+        texto.append("\nEmpresa: ").append(c[14]).append("\nResponsable: ").append(c[13]).append("\nPago: ").append(c[9]).append("\nReferencia: ").append(c[10]);
+        if(c[11]!=null)texto.append("\nRecibido: $").append(c[11]).append(" | Cambio: $").append(c[12]);
         if(c[7]!=null)texto.append("\nMotivo de anulación: ").append(c[7]);
         if(c[8]!=null)texto.append("\nReemplazada por factura: ").append(c[8]);
-        for (String[] d : consultar("select producto_factura,cantidad,precio_unitario,subtotal,unidades_gratis,descuento,base,iva,total from pos.detalle_ventas where venta_id=? order by id",id)) {
+        for (String[] d : consultar("select producto_factura,cantidad,precio_unitario,subtotal,unidades_gratis,descuento,base,iva,total,porcentaje_iva from pos.detalle_ventas where venta_id=? order by id",id)) {
             texto.append("\n--------------------\nProducto: ").append(d[0]).append("\nCantidad: ").append(d[1])
                  .append(" | Precio: $").append(d[2]).append("\nSubtotal: $").append(d[3])
                  .append(" | Unidades gratis: ").append(d[4]).append("\nDescuento: $").append(d[5])
-                 .append("\nBase: $").append(d[6]).append(" | IVA simulado 19%: $").append(d[7])
+                 .append("\nBase: $").append(d[6]).append(" | IVA ").append(d[9]).append("%: $").append(d[7])
                  .append("\nTotal producto: $").append(d[8]);
         }
         String[] t=consultar("select subtotal,descuento,base,iva,total from pos.resumen_ventas where id=?",id).get(0);

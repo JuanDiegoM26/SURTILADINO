@@ -68,7 +68,7 @@ public class CrudDatos {
  }
  public long corregirMovimiento(long registro,Integer cantidad,String motivo)throws SQLException{
   return transaccion(()->{
-   List<String[]> rows=d.consultar("select producto_id,tipo,cantidad,reversa_de from pos.movimientos_kardex where id=?",registro);
+   List<String[]> rows=d.consultar("select producto_id,tipo,cantidad,reversa_de,motivo_tipo,documento_referencia,proveedor_id,costo_registrado from pos.movimientos_kardex where id=?",registro);
    if(rows.isEmpty())throw new IllegalArgumentException("El movimiento no existe.");String[] r=rows.get(0);long producto=Long.parseLong(r[0]);
    // Mismo orden que el trigger: primero producto, después movimiento.
    d.consultar("select id from pos.productos where id=? for update",producto);d.consultar("select id from pos.movimientos_kardex where id=? for update",registro);
@@ -76,7 +76,8 @@ public class CrudDatos {
    String inverso=r[1].equals("AJUSTE_SALIDA")?"AJUSTE_ENTRADA":"AJUSTE_SALIDA";
    long reversa=movimiento(producto,inverso,Integer.parseInt(r[2]),motivo,registro);
    if(cantidad==null)return reversa;
-   return movimiento(producto,r[1].equals("INICIAL")?"ENTRADA":r[1],cantidad,motivo,null);
+   if(cantidad<=0)throw new IllegalArgumentException("La cantidad debe ser mayor que cero.");
+   return Long.parseLong(d.consultar("insert into pos.movimientos_kardex(producto_id,tipo,cantidad,observacion,motivo_tipo,documento_referencia,proveedor_id,costo_registrado) values(?,?,?,?,?,?,?,?) returning id",producto,r[1].equals("INICIAL")?"ENTRADA":r[1],cantidad,motivo.trim(),r[4],r[5],r[6]==null?null:Long.valueOf(r[6]),r[7]==null?null:new BigDecimal(r[7])).get(0)[0]);
   });
  }
  public void anular(long venta,String motivo)throws SQLException{
