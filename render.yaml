@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: surtiladino
+    runtime: docker
+    plan: free
+    region: virginia
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: SURTI_MODE
+        value: cloud
+# Antes de iniciar: agregar dos Secret Files en Render:
+# conexion.properties y acceso.local.properties. Nunca subirlos al repositorio.
+# La base de datos existente sigue en Supabase; este archivo no crea otra.
