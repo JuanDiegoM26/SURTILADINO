@@ -1,0 +1,11 @@
+conexion.properties
+acceso.local.properties
+*.local.properties
+.env
+.env.*
+*.zip
+target/
+verificacion/
+respaldo*/
+*.class
+*.log
